@@ -1,0 +1,16 @@
+{
+  "searches": [
+    {
+      "start_date": "2026-06-25",
+      "end_date": "2026-07-06",
+      "property": "ahwahnee,valley-lodge",
+      "adults": 2,
+      "children": 2,
+      "scan": true
+    }
+  ],
+  "pushover": {
+    "user_key": "",
+    "api_token": ""
+  }
+}

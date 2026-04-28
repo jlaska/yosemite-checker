@@ -1,0 +1,14 @@
+# Local config with secrets — never commit
+config.json
+
+# Diagnostic dumps
+diag_*.html
+diag_*.log
+
+# uv / Python
+.venv/
+__pycache__/
+*.pyc
+
+# Saved HTML
+yosemite_results*.html

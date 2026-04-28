@@ -33,7 +33,7 @@ uninstall:
 	@echo "Uninstalled."
 
 run: _check-config
-	bash run_checker.sh
+	HEADLESS=$(HEADLESS) bash run_checker.sh
 
 test-pushover: _check-config
 	@user_key=$$(python3 -c "import json; print(json.load(open('$(CONFIG)'))['pushover']['user_key'])"); \
@@ -43,6 +43,8 @@ test-pushover: _check-config
 		--form-string "user=$$user_key" \
 		--form-string "title=Yosemite Checker Test" \
 		--form-string "message=Test notification from yosemite-checker" \
+		--form-string "priority=1" \
+		--form-string "sound=siren" \
 		https://api.pushover.net/1/messages.json && echo " Pushover notification sent"
 
 status:

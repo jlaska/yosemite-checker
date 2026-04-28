@@ -7,33 +7,24 @@ CHECKER="$SCRIPT_DIR/yosemite_checker.py"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
-# Read Pushover credentials from config
-read_config() {
-    python3 -c "
-import json, sys
-cfg = json.load(open('$CONFIG'))
-po = cfg.get('pushover', {})
-print(po.get('user_key', ''))
-print(po.get('api_token', ''))
-"
-}
-
 send_pushover() {
-    local user_key="$1" api_token="$2" title="$3" message="$4"
+    local user_key="$1" api_token="$2" title="$3" message="$4" priority="${5:-0}"
     curl -s \
         --form-string "token=$api_token" \
         --form-string "user=$user_key" \
         --form-string "title=$title" \
         --form-string "message=$message" \
-        --form-string "priority=0" \
+        --form-string "priority=$priority" \
+        --form-string "sound=siren" \
         https://api.pushover.net/1/messages.json > /dev/null
 }
 
 main() {
     log "Starting Yosemite availability check"
 
-    mapfile -t creds < <(read_config)
-    local user_key="${creds[0]}" api_token="${creds[1]}"
+    local user_key api_token
+    user_key=$(python3 -c "import json; print(json.load(open('$CONFIG'))['pushover']['user_key'])")
+    api_token=$(python3 -c "import json; print(json.load(open('$CONFIG'))['pushover']['api_token'])")
 
     if [[ -z "$user_key" || -z "$api_token" ]]; then
         log "ERROR: Pushover credentials not set in config.json"
@@ -42,7 +33,10 @@ main() {
 
     local output
     local exit_code=0
-    output=$(uv run "$CHECKER" --config "$CONFIG" -o json 2>&1) || exit_code=$?
+    # Capture stdout (JSON) only; stderr (progress logs) flows through to the log file
+    local headless_flag=""
+    [[ "${HEADLESS:-1}" == "0" ]] && headless_flag="--no-headless"
+    output=$(uv run "$CHECKER" --config "$CONFIG" -o json $headless_flag) || exit_code=$?
 
     if [[ $exit_code -eq 0 ]]; then
         log "Availability found!"
@@ -62,7 +56,7 @@ print('\n'.join(lines))
         log "$summary"
         send_pushover "$user_key" "$api_token" \
             "🏕 Yosemite Availability!" \
-            "$summary"
+            "$summary" 1
         log "Pushover notification sent"
     elif [[ $exit_code -eq 1 ]]; then
         log "No availability found"

@@ -602,7 +602,7 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.subcommand is None and not args.start_date:
+    if args.subcommand is None and not args.start_date and not getattr(args, "config", None):
         parser.print_help()
         sys.exit(0)
 

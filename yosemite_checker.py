@@ -30,6 +30,7 @@ for _code, _info in PROPERTIES.items():
         ALIAS_MAP[_alias.lower()] = _code
 
 SEARCH_URL = "https://reservations.ahlsmsworld.com/Yosemite/Search/Accomodations/"
+# SEARCH_URL = "https://reservations.ahlsmsworld.com/Yosemite/Plan-Your-Trip"
 
 
 def resolve_properties(raw: str) -> list[str]:
@@ -74,19 +75,64 @@ class YosemiteChecker:
 
     async def __aenter__(self):
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(headless=self.headless)
+        self._browser = await self._playwright.chromium.launch(
+            headless=self.headless,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
         self._context = await self._browser.new_context(
-            viewport={"width": 1920, "height": 1080},
+            viewport={"width": 1320, "height": 900},
             user_agent=(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/147.0.0.0 Safari/537.36"
+                "Chrome/145.0.0.0 Safari/537.36"
             ),
+            # Override Sec-CH-UA client hint headers to remove HeadlessChrome —
+            # reCAPTCHA Enterprise reads these and refuses to issue tokens for
+            # headless browsers.
+            extra_http_headers={
+                "Sec-CH-UA": '"Not/A)Brand";v="8", "Chromium";v="145", "Google Chrome";v="145"',
+                "Sec-CH-UA-Mobile": "?0",
+                "Sec-CH-UA-Platform": '"macOS"',
+            },
         )
+        # Patch JS-visible automation signals reCAPTCHA checks
+        await self._context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            if (navigator.userAgentData) {
+                const brands = [
+                    {brand: 'Not/A)Brand',    version: '8'},
+                    {brand: 'Chromium',        version: '145'},
+                    {brand: 'Google Chrome',   version: '145'},
+                ];
+                Object.defineProperty(navigator, 'userAgentData', {get: () => ({
+                    brands,
+                    mobile: false,
+                    platform: 'macOS',
+                    getHighEntropyValues: async () => ({
+                        brands,
+                        fullVersionList: [
+                            {brand: 'Not/A)Brand',  version: '8.0.0.0'},
+                            {brand: 'Chromium',      version: '145.0.0.0'},
+                            {brand: 'Google Chrome', version: '145.0.0.0'},
+                        ],
+                        mobile: false,
+                        platform: 'macOS',
+                        platformVersion: '10_15_7',
+                        architecture: 'x86',
+                        bitness: '64',
+                        model: '',
+                        uaFullVersion: '145.0.0.0',
+                    }),
+                })});
+            }
+        """)
         self._page = await self._context.new_page()
         self._page.set_default_timeout(90_000)
         self._console_log: list[str] = []
         self._page.on("console", lambda msg: self._console_log.append(f"[{msg.type}] {msg.text}"))
+        self._page.on("requestfailed", lambda req: self._console_log.append(
+            f"[requestfailed] {req.failure} — {req.url}"
+        ))
         return self
 
     async def __aexit__(self, *_):
@@ -152,9 +198,11 @@ class YosemiteChecker:
 
         # Retry loop: if the page's reCAPTCHA/blockUI init gets stuck, reload and try again.
         max_attempts = 3
+        retry_delay = 15  # seconds between attempts
         for attempt in range(1, max_attempts + 1):
             if attempt > 1:
-                print(f"  retrying (attempt {attempt}/{max_attempts}) ...", file=sys.stderr)
+                print(f"  waiting {retry_delay}s before retry (attempt {attempt}/{max_attempts}) ...", file=sys.stderr)
+                await page.wait_for_timeout(retry_delay * 1000)
 
             await page.goto(SEARCH_URL, wait_until="load", timeout=90_000)
             await page.wait_for_timeout(3_000)

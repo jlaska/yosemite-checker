@@ -78,6 +78,26 @@ class YosemiteChecker:
             headless=self.headless,
             args=["--disable-blink-features=AutomationControlled"],
         )
+        self._console_log: list[str] = []
+        await self._new_context()
+        return self
+
+    async def __aexit__(self, *_):
+        if self._page:
+            await self._page.close()
+        if self._context:
+            await self._context.close()
+        if self._browser:
+            await self._browser.close()
+        if self._playwright:
+            await self._playwright.stop()
+
+    async def _new_context(self) -> None:
+        """Create a fresh browser context and page with clean cookies/session."""
+        if self._page:
+            await self._page.close()
+        if self._context:
+            await self._context.close()
         self._context = await self._browser.new_context(
             viewport={"width": 1320, "height": 900},
             user_agent=(
@@ -85,16 +105,12 @@ class YosemiteChecker:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/145.0.0.0 Safari/537.36"
             ),
-            # Override Sec-CH-UA client hint headers to remove HeadlessChrome —
-            # reCAPTCHA Enterprise reads these and refuses to issue tokens for
-            # headless browsers.
             extra_http_headers={
                 "Sec-CH-UA": '"Not/A)Brand";v="8", "Chromium";v="145", "Google Chrome";v="145"',
                 "Sec-CH-UA-Mobile": "?0",
                 "Sec-CH-UA-Platform": '"macOS"',
             },
         )
-        # Patch JS-visible automation signals reCAPTCHA checks
         await self._context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             if (navigator.userAgentData) {
@@ -127,22 +143,11 @@ class YosemiteChecker:
         """)
         self._page = await self._context.new_page()
         self._page.set_default_timeout(90_000)
-        self._console_log: list[str] = []
+        self._console_log = []
         self._page.on("console", lambda msg: self._console_log.append(f"[{msg.type}] {msg.text}"))
         self._page.on("requestfailed", lambda req: self._console_log.append(
             f"[requestfailed] {req.failure} — {req.url}"
         ))
-        return self
-
-    async def __aexit__(self, *_):
-        if self._page:
-            await self._page.close()
-        if self._context:
-            await self._context.close()
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
 
     async def dump_diagnostics(self, label: str) -> str:
         """Save current DOM and console log to a timestamped file pair, return base path."""
@@ -276,7 +281,9 @@ class YosemiteChecker:
             if action_not_allowed:
                 if attempt == max_attempts:
                     raise RuntimeError("'Action not allowed' validation error persisted after all retries")
-                print("  'Action not allowed' from server, reloading and retrying ...", file=sys.stderr)
+                print("  'Action not allowed' from server, resetting browser context ...", file=sys.stderr)
+                await self._new_context()
+                page = self._page
                 continue
 
             break  # successfully reached results page

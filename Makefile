@@ -4,19 +4,21 @@ PLIST_DEST  := $(HOME)/Library/LaunchAgents/$(PLIST_NAME).plist
 LOG_FILE    := $(HOME)/Library/Logs/yosemite-checker.log
 CONFIG      := config.json
 
-.PHONY: setup install uninstall run test-pushover status logs clean help
+.PHONY: setup install uninstall run test-pushover status logs clean release version help
 
 help:
 	@echo "Yosemite availability checker"
 	@echo ""
-	@echo "  make setup          Install Chromium for Playwright (one-time)"
-	@echo "  make install        Install hourly launchd job"
-	@echo "  make uninstall      Remove launchd job"
-	@echo "  make run            Run a check right now (manual)"
-	@echo "  make test-pushover  Send a test Pushover notification"
-	@echo "  make status         Show launchd job status"
-	@echo "  make logs           Tail the log file"
-	@echo "  make clean          Remove logs and diagnostic files"
+	@echo "  make setup              Install Chromium for Playwright (one-time)"
+	@echo "  make install            Install hourly launchd job"
+	@echo "  make uninstall          Remove launchd job"
+	@echo "  make run                Run a check right now (manual)"
+	@echo "  make test-pushover      Send a test Pushover notification"
+	@echo "  make status             Show launchd job status"
+	@echo "  make logs               Tail the log file"
+	@echo "  make clean              Remove logs and diagnostic files"
+	@echo "  make version            Show current release version"
+	@echo "  make release VERSION=x.y.z  Tag and push a new release"
 
 setup:
 	uv run playwright install chromium
@@ -56,6 +58,18 @@ logs:
 
 clean:
 	rm -f "$(LOG_FILE)" diag_*.html diag_*.log
+
+version:
+	@git describe --tags --abbrev=0 2>/dev/null || echo "(no tags yet)"
+
+release:
+	@test -n "$(VERSION)" || (echo "ERROR: specify a version, e.g. make release VERSION=0.2.0" && exit 1)
+	@git diff --quiet && git diff --cached --quiet || (echo "ERROR: uncommitted changes — commit or stash first" && exit 1)
+	@echo "Tagging v$(VERSION) and pushing..."
+	git tag v$(VERSION)
+	git push origin main
+	git push origin v$(VERSION)
+	@echo "Done. Watch CI at https://github.com/jlaska/yosemite-checker/actions"
 
 _check-config:
 	@test -f "$(CONFIG)" || (echo "ERROR: $(CONFIG) not found. Copy config.json.example to config.json and fill in your credentials." && exit 1)

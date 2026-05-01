@@ -164,27 +164,42 @@ class YosemiteChecker:
         ))
 
     async def dump_diagnostics(self, label: str) -> str:
-        """Save current DOM and console log to a timestamped file pair, return base path."""
+        """Save current DOM and console log to a timestamped file pair, return base path.
+
+        Also prints the log to stderr so it appears in kubectl logs from in-cluster runs.
+        """
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe = label.replace(" ", "_").replace("/", "-")
         base = f"diag_{safe}_{ts}"
+
+        lines: list[str] = []
+        lines.append(f"URL: {self._page.url}")
+        try:
+            token_val = await self._page.evaluate(
+                "() => { const t = document.querySelector('#box-widget_RecaptchaToken'); return t ? t.value : 'NOT FOUND'; }"
+            )
+            lines.append(f"RecaptchaToken: {'<populated>' if token_val else '<empty>'}")
+        except Exception:
+            lines.append("RecaptchaToken: <could not read>")
+        lines.append("")
+        lines.extend(self._console_log)
+        log_content = "\n".join(lines)
+
         try:
             html = await self._page.content()
             with open(f"{base}.html", "w", encoding="utf-8") as f:
                 f.write(html)
         except Exception as e:
             print(f"  (could not save HTML: {e})", file=sys.stderr)
+
         with open(f"{base}.log", "w", encoding="utf-8") as f:
-            f.write(f"URL: {self._page.url}\n")
-            try:
-                token_val = await self._page.evaluate(
-                    "() => { const t = document.querySelector('#box-widget_RecaptchaToken'); return t ? t.value : 'NOT FOUND'; }"
-                )
-                f.write(f"RecaptchaToken: {'<populated>' if token_val else '<empty>'}\n")
-            except Exception:
-                f.write("RecaptchaToken: <could not read>\n")
-            f.write("\n")
-            f.write("\n".join(self._console_log))
+            f.write(log_content)
+
+        # Print to stderr so diagnostics appear in kubectl logs for in-cluster runs
+        print(f"\n--- diagnostic log: {base} ---", file=sys.stderr)
+        print(log_content, file=sys.stderr)
+        print("--- end diagnostic log ---", file=sys.stderr)
+
         return base
 
     async def _wait_for_loading(self, page: Page) -> None:

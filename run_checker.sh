@@ -34,8 +34,8 @@ main() {
     local output
     local exit_code=0
     # Capture stdout (JSON) only; stderr (progress logs) flows through to the log file
-    local headless_flag=""
-    [[ "${HEADLESS:-1}" == "0" ]] && headless_flag="--no-headless"
+    local headless_flag="--no-headless"
+    [[ "${HEADLESS:-0}" == "1" ]] && headless_flag=""
     output=$(uv run "$CHECKER" --config "$CONFIG" -o json $headless_flag) || exit_code=$?
 
     if [[ $exit_code -eq 0 ]]; then

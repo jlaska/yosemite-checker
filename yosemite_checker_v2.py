@@ -161,7 +161,15 @@ class YosemiteChecker:
         except Exception as e:
             print(f"  (could not save HTML: {e})", file=sys.stderr)
         with open(f"{base}.log", "w", encoding="utf-8") as f:
-            f.write(f"URL: {self._page.url}\n\n")
+            f.write(f"URL: {self._page.url}\n")
+            try:
+                token_val = await self._page.evaluate(
+                    "() => { const t = document.querySelector('#box-widget_RecaptchaToken'); return t ? t.value : 'NOT FOUND'; }"
+                )
+                f.write(f"RecaptchaToken: {'<populated>' if token_val else '<empty>'}\n")
+            except Exception:
+                f.write("RecaptchaToken: <could not read>\n")
+            f.write("\n")
             f.write("\n".join(self._console_log))
         return base
 
@@ -253,7 +261,21 @@ class YosemiteChecker:
             await page.keyboard.press("Escape")
             await self._wait_for_loading(page)
 
-            # 8. Submit
+            # 8. Wait for reCAPTCHA to populate the token — an empty token
+            #    guarantees "Action not allowed" from the server.
+            try:
+                await page.wait_for_function(
+                    "() => { const t = document.querySelector('#box-widget_RecaptchaToken'); return t && t.value !== ''; }",
+                    timeout=30_000,
+                )
+            except Exception:
+                if attempt == max_attempts:
+                    raise RuntimeError("reCAPTCHA token never generated after all retries")
+                print("  reCAPTCHA token not generated, resetting context ...", file=sys.stderr)
+                await self._new_context()
+                page = self._page
+                continue
+
             await page.click("#box-widget > form .wxa-input-container-form-button-panel input.wxa-form-button")
             await self._wait_for_loading(page)
 

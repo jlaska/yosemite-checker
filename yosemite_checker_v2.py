@@ -261,17 +261,16 @@ class YosemiteChecker:
             await page.keyboard.press("Escape")
             await self._wait_for_loading(page)
 
-            # 8. Wait for reCAPTCHA to populate the token — an empty token
-            #    guarantees "Action not allowed" from the server.
+            # 8. Wait for reCAPTCHA to signal readiness before clicking.
+            #    The blockUI overlay is shown while reCAPTCHA initializes;
+            #    clearing it means it is ready to generate a token on submit.
+            #    The token itself is populated BY the click handler, not before.
             try:
-                await page.wait_for_function(
-                    "() => { const t = document.querySelector('#box-widget_RecaptchaToken'); return t && t.value !== ''; }",
-                    timeout=30_000,
-                )
+                await page.wait_for_selector(".blockUI.blockOverlay", state="hidden", timeout=30_000)
             except Exception:
                 if attempt == max_attempts:
-                    raise RuntimeError("reCAPTCHA token never generated after all retries")
-                print("  reCAPTCHA token not generated, resetting context ...", file=sys.stderr)
+                    raise RuntimeError("reCAPTCHA never became ready after all retries")
+                print("  reCAPTCHA not ready (blockUI stuck), resetting context ...", file=sys.stderr)
                 await self._new_context()
                 page = self._page
                 continue

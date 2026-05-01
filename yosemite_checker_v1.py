@@ -29,7 +29,8 @@ for _code, _info in PROPERTIES.items():
     for _alias in _info["aliases"]:
         ALIAS_MAP[_alias.lower()] = _code
 
-SEARCH_URL = "https://reservations.ahlsmsworld.com/Yosemite/Plan-Your-Trip"
+SEARCH_URL = "https://reservations.ahlsmsworld.com/Yosemite/Search/Accomodations/"
+# SEARCH_URL = "https://reservations.ahlsmsworld.com/Yosemite/Plan-Your-Trip"
 
 
 def resolve_properties(raw: str) -> list[str]:
@@ -78,26 +79,6 @@ class YosemiteChecker:
             headless=self.headless,
             args=["--disable-blink-features=AutomationControlled"],
         )
-        self._console_log: list[str] = []
-        await self._new_context()
-        return self
-
-    async def __aexit__(self, *_):
-        if self._page:
-            await self._page.close()
-        if self._context:
-            await self._context.close()
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
-
-    async def _new_context(self) -> None:
-        """Create a fresh browser context and page with clean cookies/session."""
-        if self._page:
-            await self._page.close()
-        if self._context:
-            await self._context.close()
         self._context = await self._browser.new_context(
             viewport={"width": 1320, "height": 900},
             user_agent=(
@@ -105,12 +86,16 @@ class YosemiteChecker:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/145.0.0.0 Safari/537.36"
             ),
+            # Override Sec-CH-UA client hint headers to remove HeadlessChrome —
+            # reCAPTCHA Enterprise reads these and refuses to issue tokens for
+            # headless browsers.
             extra_http_headers={
                 "Sec-CH-UA": '"Not/A)Brand";v="8", "Chromium";v="145", "Google Chrome";v="145"',
                 "Sec-CH-UA-Mobile": "?0",
                 "Sec-CH-UA-Platform": '"macOS"',
             },
         )
+        # Patch JS-visible automation signals reCAPTCHA checks
         await self._context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             if (navigator.userAgentData) {
@@ -143,11 +128,22 @@ class YosemiteChecker:
         """)
         self._page = await self._context.new_page()
         self._page.set_default_timeout(90_000)
-        self._console_log = []
+        self._console_log: list[str] = []
         self._page.on("console", lambda msg: self._console_log.append(f"[{msg.type}] {msg.text}"))
         self._page.on("requestfailed", lambda req: self._console_log.append(
             f"[requestfailed] {req.failure} — {req.url}"
         ))
+        return self
+
+    async def __aexit__(self, *_):
+        if self._page:
+            await self._page.close()
+        if self._context:
+            await self._context.close()
+        if self._browser:
+            await self._browser.close()
+        if self._playwright:
+            await self._playwright.stop()
 
     async def dump_diagnostics(self, label: str) -> str:
         """Save current DOM and console log to a timestamped file pair, return base path."""
@@ -161,31 +157,9 @@ class YosemiteChecker:
         except Exception as e:
             print(f"  (could not save HTML: {e})", file=sys.stderr)
         with open(f"{base}.log", "w", encoding="utf-8") as f:
-            f.write(f"URL: {self._page.url}\n")
-            try:
-                token_val = await self._page.evaluate(
-                    "() => { const t = document.querySelector('#box-widget_RecaptchaToken'); return t ? t.value : 'NOT FOUND'; }"
-                )
-                f.write(f"RecaptchaToken: {'<populated>' if token_val else '<empty>'}\n")
-            except Exception:
-                f.write("RecaptchaToken: <could not read>\n")
-            f.write("\n")
+            f.write(f"URL: {self._page.url}\n\n")
             f.write("\n".join(self._console_log))
         return base
-
-    async def _wait_for_loading(self, page: Page) -> None:
-        """Wait for wxa-widget-loading or blockUI overlays to appear and clear."""
-        try:
-            await page.wait_for_selector(".wxa-widget-loading", state="visible", timeout=2_000)
-            await page.wait_for_selector(".wxa-widget-loading", state="hidden", timeout=30_000)
-        except Exception:
-            pass
-        try:
-            overlay = await page.query_selector(".blockUI.blockOverlay")
-            if overlay and await overlay.is_visible():
-                await page.wait_for_selector(".blockUI.blockOverlay", state="hidden", timeout=30_000)
-        except Exception:
-            pass
 
     async def search(
         self,
@@ -199,9 +173,13 @@ class YosemiteChecker:
         page = self._page
         self._console_log.clear()
 
+        # Inject a dataLayer interceptor before navigating so we capture push events
+        captured_items: list[dict] = []
+
         async def intercept_data_layer():
             await page.evaluate("""() => {
                 window.__capturedRooms = [];
+                const orig = window.dataLayer ? window.dataLayer.push.bind(window.dataLayer) : null;
                 window.dataLayer = window.dataLayer || [];
                 const origPush = window.dataLayer.push.bind(window.dataLayer);
                 window.dataLayer.push = function(obj) {
@@ -218,68 +196,61 @@ class YosemiteChecker:
         arr_nd  = arrival.strftime("%Y-%m-%d")
         dep_nd  = departure.strftime("%Y-%m-%d")
 
+        # Retry loop: if the page's reCAPTCHA/blockUI init gets stuck, reload and try again.
         max_attempts = 3
-        retry_delay  = 15
+        retry_delay = 15  # seconds between attempts
         for attempt in range(1, max_attempts + 1):
             if attempt > 1:
                 print(f"  waiting {retry_delay}s before retry (attempt {attempt}/{max_attempts}) ...", file=sys.stderr)
                 await page.wait_for_timeout(retry_delay * 1000)
 
-            # 1. Navigate to the Plan-Your-Trip landing page
             await page.goto(SEARCH_URL, wait_until="load", timeout=90_000)
+            await page.wait_for_timeout(3_000)
             await page.wait_for_load_state("domcontentloaded")
+
             await intercept_data_layer()
-            await self._wait_for_loading(page)
 
-            # 2. Select property in the initial widget (value format "2:CODE")
-            await page.select_option("#box-widget_InitialProductSelection", f"2:{property_code}")
-            await self._wait_for_loading(page)
+            # Set property
+            await page.select_option("#box-widget_ProductSelection", property_code)
+            await page.wait_for_timeout(500)
 
-            # 3-5. Set rooms, adults, children
-            await page.select_option("#box-widget_UnitCount", str(rooms))
-            await self._wait_for_loading(page)
-            await page.select_option("#box-widget_Adults", str(adults))
-            await self._wait_for_loading(page)
+            # Set dates — fill both the hidden native date input and the visible text input.
+            # The datepicker syncs from the _nd input via change events.
+            await page.evaluate(f"""() => {{
+                const arrNd  = document.querySelector('#box-widget_ArrivalDate_nd');
+                const arrVis = document.querySelector('#box-widget_ArrivalDate');
+                const depNd  = document.querySelector('#box-widget_DepartureDate_nd');
+                const depVis = document.querySelector('#box-widget_DepartureDate');
+                if (arrNd)  {{ arrNd.value  = '{arr_nd}';  arrNd.dispatchEvent(new Event('change', {{bubbles:true}})); }}
+                if (arrVis) {{ arrVis.value = '{arr_str}'; arrVis.dispatchEvent(new Event('change', {{bubbles:true}})); }}
+                if (depNd)  {{ depNd.value  = '{dep_nd}';  depNd.dispatchEvent(new Event('change', {{bubbles:true}})); }}
+                if (depVis) {{ depVis.value = '{dep_str}'; depVis.dispatchEvent(new Event('change', {{bubbles:true}})); }}
+            }}""")
+            await page.wait_for_timeout(500)
+
+            # Set guest counts
+            await page.select_option("#box-widget_Adults",   str(adults))
             await page.select_option("#box-widget_Children", str(children))
-            await self._wait_for_loading(page)
+            await page.select_option("#box-widget_UnitCount", str(rooms))
+            await page.wait_for_timeout(1_500)
 
-            # 6. Set check-in: click calendar icon to activate the datepicker,
-            #    then set values. The _nd input is hidden so use JS; the visible
-            #    text input accepts fill() after the datepicker opens.
-            await page.click("#box-widget > form .wxa-input-container-ArrivalDate .input-group-addon i")
-            await page.wait_for_timeout(300)
-            await page.evaluate(f"document.querySelector('#box-widget_ArrivalDate_nd').value = '{arr_nd}'")
-            await page.fill("#box-widget_ArrivalDate", arr_str)
-            await page.keyboard.press("Escape")  # dismiss the calendar popup
-            await self._wait_for_loading(page)
-
-            # 7. Set check-out: same pattern
-            await page.click("#box-widget > form .wxa-input-container-DepartureDate .input-group-addon i")
-            await page.wait_for_timeout(300)
-            await page.evaluate(f"document.querySelector('#box-widget_DepartureDate_nd').value = '{dep_nd}'")
-            await page.fill("#box-widget_DepartureDate", dep_str)
-            await page.keyboard.press("Escape")
-            await self._wait_for_loading(page)
-
-            # 8. Wait for reCAPTCHA to signal readiness before clicking.
-            #    The blockUI overlay is shown while reCAPTCHA initializes;
-            #    clearing it means it is ready to generate a token on submit.
-            #    The token itself is populated BY the click handler, not before.
+            # Wait for the blockUI overlay (shown during reCAPTCHA init) to clear.
+            # If it stays stuck the page's JS has wedged; reload and retry.
             try:
-                await page.wait_for_selector(".blockUI.blockOverlay", state="hidden", timeout=30_000)
+                await page.wait_for_selector(".blockUI.blockOverlay", state="hidden", timeout=60_000)
             except Exception:
                 if attempt == max_attempts:
-                    raise RuntimeError("reCAPTCHA never became ready after all retries")
-                print("  reCAPTCHA not ready (blockUI stuck), resetting context ...", file=sys.stderr)
-                await self._new_context()
-                page = self._page
+                    raise
+                print(f"  blockUI overlay stuck after 60s, reloading page ...", file=sys.stderr)
                 continue
 
-            await page.click("#box-widget > form .wxa-input-container-form-button-panel input.wxa-form-button")
-            await self._wait_for_loading(page)
+            # Submit — target the enabled button inside the actual search form
+            # (there's also a disabled button in the hidden overview widget)
+            await page.click('form[name="wxa-form-search"] input.wxa-form-button')
 
-            # 9. Wait for results (redirect: PleaseWait → Results)
-            # Also detect "Action not allowed" validation error
+            # Wait for results (redirect chain: PleaseWait → Results).
+            # Also watch for a server-side validation error ("Action not allowed")
+            # which keeps the page on the search URL with an error banner.
             deadline = asyncio.get_event_loop().time() + 90
             action_not_allowed = False
             while True:
@@ -302,9 +273,7 @@ class YosemiteChecker:
             if action_not_allowed:
                 if attempt == max_attempts:
                     raise RuntimeError("'Action not allowed' validation error persisted after all retries")
-                print("  'Action not allowed' from server, resetting browser context ...", file=sys.stderr)
-                await self._new_context()
-                page = self._page
+                print("  'Action not allowed' from server, reloading and retrying ...", file=sys.stderr)
                 continue
 
             break  # successfully reached results page
@@ -312,7 +281,7 @@ class YosemiteChecker:
         await page.wait_for_load_state("load")
         await page.wait_for_timeout(2_000)
 
-        # Collect GA dataLayer items (primary)
+        # Attempt to collect GA dataLayer items
         try:
             raw_items = await page.evaluate("() => window.__capturedRooms || []")
             if raw_items:

@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="$SCRIPT_DIR/config.json"
-CHECKER="$SCRIPT_DIR/yosemite_checker_v2.py"
+CHECKER="$SCRIPT_DIR/yosemite_checker.py"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 

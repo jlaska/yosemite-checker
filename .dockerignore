@@ -1,0 +1,14 @@
+.git/
+.github/
+venv/
+__pycache__/
+*.pyc
+config.json
+diag_*.html
+diag_*.log
+yosemite_results*.html
+Makefile
+run_checker.sh
+com.jlaska.yosemite-checker.plist
+README.md
+yosemite_checker_v1.py

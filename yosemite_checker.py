@@ -9,7 +9,10 @@ reservations.ahlsmsworld.com and reports available rooms.
 import argparse
 import asyncio
 import json
+import os
 import sys
+import urllib.request
+import urllib.parse
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -29,8 +32,7 @@ for _code, _info in PROPERTIES.items():
     for _alias in _info["aliases"]:
         ALIAS_MAP[_alias.lower()] = _code
 
-SEARCH_URL = "https://reservations.ahlsmsworld.com/Yosemite/Search/Accomodations/"
-# SEARCH_URL = "https://reservations.ahlsmsworld.com/Yosemite/Plan-Your-Trip"
+SEARCH_URL = "https://reservations.ahlsmsworld.com/Yosemite/Plan-Your-Trip"
 
 
 def resolve_properties(raw: str) -> list[str]:
@@ -66,8 +68,9 @@ def fmt_date_short(d: datetime) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class YosemiteChecker:
-    def __init__(self, headless: bool = True):
+    def __init__(self, headless: bool = True, browser_ws: str | None = None):
         self.headless = headless
+        self._browser_ws = browser_ws
         self._playwright = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
@@ -75,10 +78,40 @@ class YosemiteChecker:
 
     async def __aenter__(self):
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=self.headless,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+        if self._browser_ws:
+            self._browser = await self._playwright.chromium.connect_over_cdp(self._browser_ws)
+        else:
+            self._browser = await self._playwright.chromium.launch(
+                headless=self.headless,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+        self._console_log: list[str] = []
+        await self._new_context()
+        return self
+
+    async def __aexit__(self, *_):
+        if self._page:
+            await self._page.close()
+        if self._context:
+            await self._context.close()
+        if self._browser:
+            await self._browser.close()
+        if self._playwright:
+            await self._playwright.stop()
+
+    async def _new_context(self) -> None:
+        """Create a fresh browser context and page with clean cookies/session.
+
+        In CDP mode (SockpuppetBrowser), also reconnects to get a brand-new
+        Chrome process rather than just a new context in the same process.
+        """
+        if self._page:
+            await self._page.close()
+        if self._context:
+            await self._context.close()
+        if self._browser_ws and self._browser:
+            await self._browser.close()
+            self._browser = await self._playwright.chromium.connect_over_cdp(self._browser_ws)
         self._context = await self._browser.new_context(
             viewport={"width": 1320, "height": 900},
             user_agent=(
@@ -86,16 +119,12 @@ class YosemiteChecker:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/145.0.0.0 Safari/537.36"
             ),
-            # Override Sec-CH-UA client hint headers to remove HeadlessChrome —
-            # reCAPTCHA Enterprise reads these and refuses to issue tokens for
-            # headless browsers.
             extra_http_headers={
                 "Sec-CH-UA": '"Not/A)Brand";v="8", "Chromium";v="145", "Google Chrome";v="145"',
                 "Sec-CH-UA-Mobile": "?0",
                 "Sec-CH-UA-Platform": '"macOS"',
             },
         )
-        # Patch JS-visible automation signals reCAPTCHA checks
         await self._context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             if (navigator.userAgentData) {
@@ -128,22 +157,11 @@ class YosemiteChecker:
         """)
         self._page = await self._context.new_page()
         self._page.set_default_timeout(90_000)
-        self._console_log: list[str] = []
+        self._console_log = []
         self._page.on("console", lambda msg: self._console_log.append(f"[{msg.type}] {msg.text}"))
         self._page.on("requestfailed", lambda req: self._console_log.append(
             f"[requestfailed] {req.failure} — {req.url}"
         ))
-        return self
-
-    async def __aexit__(self, *_):
-        if self._page:
-            await self._page.close()
-        if self._context:
-            await self._context.close()
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
 
     async def dump_diagnostics(self, label: str) -> str:
         """Save current DOM and console log to a timestamped file pair, return base path."""
@@ -157,9 +175,31 @@ class YosemiteChecker:
         except Exception as e:
             print(f"  (could not save HTML: {e})", file=sys.stderr)
         with open(f"{base}.log", "w", encoding="utf-8") as f:
-            f.write(f"URL: {self._page.url}\n\n")
+            f.write(f"URL: {self._page.url}\n")
+            try:
+                token_val = await self._page.evaluate(
+                    "() => { const t = document.querySelector('#box-widget_RecaptchaToken'); return t ? t.value : 'NOT FOUND'; }"
+                )
+                f.write(f"RecaptchaToken: {'<populated>' if token_val else '<empty>'}\n")
+            except Exception:
+                f.write("RecaptchaToken: <could not read>\n")
+            f.write("\n")
             f.write("\n".join(self._console_log))
         return base
+
+    async def _wait_for_loading(self, page: Page) -> None:
+        """Wait for wxa-widget-loading or blockUI overlays to appear and clear."""
+        try:
+            await page.wait_for_selector(".wxa-widget-loading", state="visible", timeout=2_000)
+            await page.wait_for_selector(".wxa-widget-loading", state="hidden", timeout=30_000)
+        except Exception:
+            pass
+        try:
+            overlay = await page.query_selector(".blockUI.blockOverlay")
+            if overlay and await overlay.is_visible():
+                await page.wait_for_selector(".blockUI.blockOverlay", state="hidden", timeout=30_000)
+        except Exception:
+            pass
 
     async def search(
         self,
@@ -173,13 +213,9 @@ class YosemiteChecker:
         page = self._page
         self._console_log.clear()
 
-        # Inject a dataLayer interceptor before navigating so we capture push events
-        captured_items: list[dict] = []
-
         async def intercept_data_layer():
             await page.evaluate("""() => {
                 window.__capturedRooms = [];
-                const orig = window.dataLayer ? window.dataLayer.push.bind(window.dataLayer) : null;
                 window.dataLayer = window.dataLayer || [];
                 const origPush = window.dataLayer.push.bind(window.dataLayer);
                 window.dataLayer.push = function(obj) {
@@ -196,61 +232,68 @@ class YosemiteChecker:
         arr_nd  = arrival.strftime("%Y-%m-%d")
         dep_nd  = departure.strftime("%Y-%m-%d")
 
-        # Retry loop: if the page's reCAPTCHA/blockUI init gets stuck, reload and try again.
         max_attempts = 3
-        retry_delay = 15  # seconds between attempts
+        retry_delay  = 15
         for attempt in range(1, max_attempts + 1):
             if attempt > 1:
                 print(f"  waiting {retry_delay}s before retry (attempt {attempt}/{max_attempts}) ...", file=sys.stderr)
                 await page.wait_for_timeout(retry_delay * 1000)
 
+            # 1. Navigate to the Plan-Your-Trip landing page
             await page.goto(SEARCH_URL, wait_until="load", timeout=90_000)
-            await page.wait_for_timeout(3_000)
             await page.wait_for_load_state("domcontentloaded")
-
             await intercept_data_layer()
+            await self._wait_for_loading(page)
 
-            # Set property
-            await page.select_option("#box-widget_ProductSelection", property_code)
-            await page.wait_for_timeout(500)
+            # 2. Select property in the initial widget (value format "2:CODE")
+            await page.select_option("#box-widget_InitialProductSelection", f"2:{property_code}")
+            await self._wait_for_loading(page)
 
-            # Set dates — fill both the hidden native date input and the visible text input.
-            # The datepicker syncs from the _nd input via change events.
-            await page.evaluate(f"""() => {{
-                const arrNd  = document.querySelector('#box-widget_ArrivalDate_nd');
-                const arrVis = document.querySelector('#box-widget_ArrivalDate');
-                const depNd  = document.querySelector('#box-widget_DepartureDate_nd');
-                const depVis = document.querySelector('#box-widget_DepartureDate');
-                if (arrNd)  {{ arrNd.value  = '{arr_nd}';  arrNd.dispatchEvent(new Event('change', {{bubbles:true}})); }}
-                if (arrVis) {{ arrVis.value = '{arr_str}'; arrVis.dispatchEvent(new Event('change', {{bubbles:true}})); }}
-                if (depNd)  {{ depNd.value  = '{dep_nd}';  depNd.dispatchEvent(new Event('change', {{bubbles:true}})); }}
-                if (depVis) {{ depVis.value = '{dep_str}'; depVis.dispatchEvent(new Event('change', {{bubbles:true}})); }}
-            }}""")
-            await page.wait_for_timeout(500)
-
-            # Set guest counts
-            await page.select_option("#box-widget_Adults",   str(adults))
-            await page.select_option("#box-widget_Children", str(children))
+            # 3-5. Set rooms, adults, children
             await page.select_option("#box-widget_UnitCount", str(rooms))
-            await page.wait_for_timeout(1_500)
+            await self._wait_for_loading(page)
+            await page.select_option("#box-widget_Adults", str(adults))
+            await self._wait_for_loading(page)
+            await page.select_option("#box-widget_Children", str(children))
+            await self._wait_for_loading(page)
 
-            # Wait for the blockUI overlay (shown during reCAPTCHA init) to clear.
-            # If it stays stuck the page's JS has wedged; reload and retry.
+            # 6. Set check-in: click calendar icon to activate the datepicker,
+            #    then set values. The _nd input is hidden so use JS; the visible
+            #    text input accepts fill() after the datepicker opens.
+            await page.click("#box-widget > form .wxa-input-container-ArrivalDate .input-group-addon i")
+            await page.wait_for_timeout(300)
+            await page.evaluate(f"document.querySelector('#box-widget_ArrivalDate_nd').value = '{arr_nd}'")
+            await page.fill("#box-widget_ArrivalDate", arr_str)
+            await page.keyboard.press("Escape")  # dismiss the calendar popup
+            await self._wait_for_loading(page)
+
+            # 7. Set check-out: same pattern
+            await page.click("#box-widget > form .wxa-input-container-DepartureDate .input-group-addon i")
+            await page.wait_for_timeout(300)
+            await page.evaluate(f"document.querySelector('#box-widget_DepartureDate_nd').value = '{dep_nd}'")
+            await page.fill("#box-widget_DepartureDate", dep_str)
+            await page.keyboard.press("Escape")
+            await self._wait_for_loading(page)
+
+            # 8. Wait for reCAPTCHA to signal readiness before clicking.
+            #    The blockUI overlay is shown while reCAPTCHA initializes;
+            #    clearing it means it is ready to generate a token on submit.
+            #    The token itself is populated BY the click handler, not before.
             try:
-                await page.wait_for_selector(".blockUI.blockOverlay", state="hidden", timeout=60_000)
+                await page.wait_for_selector(".blockUI.blockOverlay", state="hidden", timeout=30_000)
             except Exception:
                 if attempt == max_attempts:
-                    raise
-                print(f"  blockUI overlay stuck after 60s, reloading page ...", file=sys.stderr)
+                    raise RuntimeError("reCAPTCHA never became ready after all retries")
+                print("  reCAPTCHA not ready (blockUI stuck), resetting context ...", file=sys.stderr)
+                await self._new_context()
+                page = self._page
                 continue
 
-            # Submit — target the enabled button inside the actual search form
-            # (there's also a disabled button in the hidden overview widget)
-            await page.click('form[name="wxa-form-search"] input.wxa-form-button')
+            await page.click("#box-widget > form .wxa-input-container-form-button-panel input.wxa-form-button")
+            await self._wait_for_loading(page)
 
-            # Wait for results (redirect chain: PleaseWait → Results).
-            # Also watch for a server-side validation error ("Action not allowed")
-            # which keeps the page on the search URL with an error banner.
+            # 9. Wait for results (redirect: PleaseWait → Results)
+            # Also detect "Action not allowed" validation error
             deadline = asyncio.get_event_loop().time() + 90
             action_not_allowed = False
             while True:
@@ -273,7 +316,9 @@ class YosemiteChecker:
             if action_not_allowed:
                 if attempt == max_attempts:
                     raise RuntimeError("'Action not allowed' validation error persisted after all retries")
-                print("  'Action not allowed' from server, reloading and retrying ...", file=sys.stderr)
+                print("  'Action not allowed' from server, resetting browser context ...", file=sys.stderr)
+                await self._new_context()
+                page = self._page
                 continue
 
             break  # successfully reached results page
@@ -281,7 +326,7 @@ class YosemiteChecker:
         await page.wait_for_load_state("load")
         await page.wait_for_timeout(2_000)
 
-        # Attempt to collect GA dataLayer items
+        # Collect GA dataLayer items (primary)
         try:
             raw_items = await page.evaluate("() => window.__capturedRooms || []")
             if raw_items:
@@ -428,6 +473,39 @@ def print_json(results: list[dict], search_meta: dict) -> None:
     print(json.dumps(output, indent=2))
 
 
+def _send_pushover(results: list[dict], search_meta: dict) -> None:
+    user_key  = os.environ.get("PUSHOVER_USER_KEY", "")
+    api_token = os.environ.get("PUSHOVER_API_TOKEN", "")
+    if not user_key or not api_token:
+        return
+    lines = [
+        f"{r['property']} — {r['room_type']} — {r['price']} ({r['dates']})"
+        for r in results
+    ]
+    n = len(results)
+    lines.append(f"\nTotal: {n} room{'s' if n != 1 else ''} available")
+    payload = urllib.parse.urlencode({
+        "token":    api_token,
+        "user":     user_key,
+        "title":    "🏕 Yosemite Availability!",
+        "message":  "\n".join(lines),
+        "priority": "1",
+        "sound":    "siren",
+    }).encode()
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(
+                "https://api.pushover.net/1/messages.json",
+                data=payload,
+                method="POST",
+            ),
+            timeout=10,
+        )
+        print("Pushover notification sent", file=sys.stderr)
+    except Exception as e:
+        print(f"Pushover notification failed: {e}", file=sys.stderr)
+
+
 def print_properties(fmt: str) -> None:
     rows = [
         {"code": code, "alias": info["aliases"][0], "name": info["name"]}
@@ -495,6 +573,9 @@ examples:
                         help="Output format (default: table)")
     parser.add_argument("--config", metavar="FILE",
                         help="JSON config file with search parameters (runs all defined searches)")
+    parser.add_argument("--browser-ws", metavar="URL",
+                        help="Connect to remote browser via CDP (e.g. ws://sockpuppetbrowser:3000) "
+                             "instead of launching local Chromium. Also reads BROWSER_WS env var.")
     parser.add_argument("--no-headless", action="store_true",
                         help="Show browser window (useful for debugging)")
     parser.add_argument("--save-html", metavar="FILE",
@@ -570,7 +651,8 @@ async def run(args: argparse.Namespace) -> None:
         print_properties(args.output)
         return
 
-    headless = not args.no_headless
+    headless   = not args.no_headless
+    browser_ws = getattr(args, "browser_ws", None) or os.environ.get("BROWSER_WS")
 
     # --config mode: run all searches defined in the JSON file
     if getattr(args, "config", None):
@@ -578,7 +660,7 @@ async def run(args: argparse.Namespace) -> None:
             cfg = json.load(f)
 
         all_results: list[dict] = []
-        async with YosemiteChecker(headless=headless) as checker:
+        async with YosemiteChecker(headless=headless, browser_ws=browser_ws) as checker:
             for search_def in cfg.get("searches", []):
                 start = parse_date(search_def["start_date"])
                 end   = parse_date(search_def["end_date"])
@@ -598,6 +680,8 @@ async def run(args: argparse.Namespace) -> None:
             print_json(all_results, search_meta)
         else:
             print_table(all_results, search_meta)
+        if all_results:
+            _send_pushover(all_results, search_meta)
         sys.exit(0 if all_results else 1)
 
     # Normal CLI mode
@@ -619,7 +703,7 @@ async def run(args: argparse.Namespace) -> None:
     prop_codes = resolve_properties(args.property) if args.property else list(PROPERTIES.keys())
     windows = _build_windows(start, end, args.scan)
 
-    async with YosemiteChecker(headless=headless) as checker:
+    async with YosemiteChecker(headless=headless, browser_ws=browser_ws) as checker:
         all_results = await _run_searches(
             checker, windows, prop_codes,
             adults=args.adults,
@@ -642,6 +726,9 @@ async def run(args: argparse.Namespace) -> None:
         print_json(all_results, search_meta)
     else:
         print_table(all_results, search_meta)
+
+    if all_results:
+        _send_pushover(all_results, search_meta)
 
     sys.exit(0 if all_results else 1)
 

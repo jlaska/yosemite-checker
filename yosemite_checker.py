@@ -8,8 +8,10 @@ reservations.ahlsmsworld.com and reports available rooms.
 
 import argparse
 import asyncio
+import calendar
 import json
 import os
+import random
 import sys
 import urllib.request
 import urllib.parse
@@ -61,6 +63,49 @@ def fmt_date(d: datetime) -> str:
 
 def fmt_date_short(d: datetime) -> str:
     return d.strftime("%m/%d")
+
+
+GREEN  = "\033[32m"
+YELLOW = "\033[33m"
+BOLD   = "\033[1m"
+RESET  = "\033[0m"
+
+
+def render_calendar(year: int, month_0: int, avail: dict[int, str], label: str,
+                    highlight_day: int | None = None) -> str:
+    """Render a cal-style month grid with ANSI-colored availability.
+
+    month_0 is 0-indexed (0=Jan) to match jQuery UI datepicker convention.
+    Significant days are green, limited are yellow. The highlight_day
+    (the target check-in or check-out day) is rendered bold.
+    """
+    month = month_0 + 1  # calendar module uses 1-indexed months
+    month_name = calendar.month_name[month]
+    title = f"{month_name} {year}"
+
+    lines = [f"  {label} calendar:", ""]
+    lines.append(f"      {title:^20}")
+    lines.append("  Su Mo Tu We Th Fr Sa")
+
+    cal = calendar.monthcalendar(year, month)
+    for week in cal:
+        cells = []
+        for day in week:
+            if day == 0:
+                cells.append("  ")
+            else:
+                s = avail.get(day, "none")
+                ds = f"{day:2d}"
+                bold = BOLD if day == highlight_day else ""
+                if s == "significant":
+                    cells.append(f"{bold}{GREEN}{ds}{RESET}")
+                elif s == "limited":
+                    cells.append(f"{bold}{YELLOW}{ds}{RESET}")
+                else:
+                    cells.append(f"{bold}{ds}{RESET}" if bold else ds)
+        lines.append("  " + " ".join(cells))
+
+    return "\n".join(lines)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -120,6 +165,7 @@ class YosemiteChecker:
                 "Chrome/145.0.0.0 Safari/537.36"
             ),
             extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
                 "Sec-CH-UA": '"Not/A)Brand";v="8", "Chromium";v="145", "Google Chrome";v="145"',
                 "Sec-CH-UA-Mobile": "?0",
                 "Sec-CH-UA-Platform": '"macOS"',
@@ -216,6 +262,96 @@ class YosemiteChecker:
         except Exception:
             pass
 
+    async def _human_delay(self, page: Page) -> None:
+        await page.wait_for_timeout(random.randint(250, 1000))
+
+    async def _read_datepicker_cells(self, page: Page) -> dict[int, str]:
+        """Parse all day cells from the currently open datepicker into a day->availability map."""
+        cells = await page.evaluate("""() => {
+            const tds = document.querySelectorAll(
+                '#ui-datepicker-div table.ui-datepicker-calendar tbody td'
+            );
+            return Array.from(tds).map(td => ({
+                classes: td.className,
+                text: (td.querySelector('a') || td.querySelector('span') || td).textContent.trim(),
+            }));
+        }""")
+
+        avail: dict[int, str] = {}
+        for cell in cells:
+            cls = cell["classes"]
+            text = cell["text"].strip()
+            if "ui-datepicker-other-month" in cls or not text or text == "\xa0":
+                continue
+            try:
+                day = int(text)
+            except ValueError:
+                continue
+            if "ui-datepickerAvail-significant" in cls:
+                avail[day] = "significant"
+            elif "ui-datepickerAvail-limited" in cls:
+                avail[day] = "limited"
+            else:
+                avail[day] = "none"
+        return avail
+
+    async def _scan_calendar_availability(self, page: Page, label: str, year: int, month: int,
+                                           highlight_day: int | None = None) -> dict[int, str]:
+        """Read datepicker cells and print a calendar grid to stderr. month is 0-indexed."""
+        avail = await self._read_datepicker_cells(page)
+        print(render_calendar(year, month, avail, label, highlight_day=highlight_day) + "\n", file=sys.stderr)
+        return avail
+
+    async def _select_date_via_picker(
+        self,
+        page: Page,
+        container_class: str,
+        target_date: datetime,
+        label: str,
+    ) -> tuple[bool, dict[int, str]]:
+        """Open the jQuery UI datepicker for container_class, navigate to target_date,
+        scan availability, and click the day if available.
+
+        Returns (selected, avail) — selected is True if the day was clicked,
+        False if no availability. avail is the day->level map for the month.
+        """
+        year = target_date.year
+        month = target_date.month - 1  # jQuery UI datepicker uses 0-indexed months
+        day = target_date.day
+
+        await page.click(f"#box-widget > form .{container_class} .input-group-addon i")
+        await self._human_delay(page)
+        await page.wait_for_selector("#ui-datepicker-div", state="visible", timeout=5_000)
+        await self._wait_for_loading(page)
+
+        await page.select_option("#ui-datepicker-div select.ui-datepicker-year", str(year))
+        await self._human_delay(page)
+        await self._wait_for_loading(page)
+
+        await page.select_option("#ui-datepicker-div select.ui-datepicker-month", str(month))
+        await self._human_delay(page)
+        await self._wait_for_loading(page)
+
+        avail = await self._scan_calendar_availability(page, label, year, month, highlight_day=day)
+
+        if avail.get(day, "none") == "none":
+            print(f"  {label} {target_date.strftime('%Y-%m-%d')}: no availability — skipping", file=sys.stderr)
+            await page.keyboard.press("Escape")
+            return False, avail
+
+        day_links = await page.query_selector_all(
+            f'#ui-datepicker-div td[data-month="{month}"][data-year="{year}"][data-handler="selectDay"] a'
+        )
+        for link in day_links:
+            if (await link.inner_text()).strip() == str(day):
+                await link.click()
+                await self._wait_for_loading(page)
+                return True, avail
+
+        raise RuntimeError(
+            f"Could not find clickable day {day} in datepicker for {target_date.strftime('%Y-%m-%d')}"
+        )
+
     async def search(
         self,
         arrival: datetime,
@@ -224,6 +360,7 @@ class YosemiteChecker:
         adults: int,
         children: int,
         rooms: int,
+        retries: int = 3,
     ) -> list[dict[str, Any]]:
         page = self._page
         self._console_log.clear()
@@ -242,12 +379,7 @@ class YosemiteChecker:
                 };
             }""")
 
-        arr_str = fmt_date(arrival)
-        dep_str = fmt_date(departure)
-        arr_nd  = arrival.strftime("%Y-%m-%d")
-        dep_nd  = departure.strftime("%Y-%m-%d")
-
-        max_attempts = 3
+        max_attempts = max(1, retries)
         retry_delay  = 15
         for attempt in range(1, max_attempts + 1):
             if attempt > 1:
@@ -272,23 +404,27 @@ class YosemiteChecker:
             await page.select_option("#box-widget_Children", str(children))
             await self._wait_for_loading(page)
 
-            # 6. Set check-in: click calendar icon to activate the datepicker,
-            #    then set values. The _nd input is hidden so use JS; the visible
-            #    text input accepts fill() after the datepicker opens.
-            await page.click("#box-widget > form .wxa-input-container-ArrivalDate .input-group-addon i")
-            await page.wait_for_timeout(300)
-            await page.evaluate(f"document.querySelector('#box-widget_ArrivalDate_nd').value = '{arr_nd}'")
-            await page.fill("#box-widget_ArrivalDate", arr_str)
-            await page.keyboard.press("Escape")  # dismiss the calendar popup
-            await self._wait_for_loading(page)
+            # 6. Set check-in via datepicker; scans calendar and returns False if unavailable
+            checkin_ok, _ = await self._select_date_via_picker(
+                page, "wxa-input-container-ArrivalDate", arrival, "Check-in"
+            )
+            if not checkin_ok:
+                return []
 
-            # 7. Set check-out: same pattern
-            await page.click("#box-widget > form .wxa-input-container-DepartureDate .input-group-addon i")
-            await page.wait_for_timeout(300)
-            await page.evaluate(f"document.querySelector('#box-widget_DepartureDate_nd').value = '{dep_nd}'")
-            await page.fill("#box-widget_DepartureDate", dep_str)
-            await page.keyboard.press("Escape")
-            await self._wait_for_loading(page)
+            # 7. Dismiss any auto-opened departure datepicker, then set check-out
+            try:
+                dp = await page.query_selector("#ui-datepicker-div")
+                if dp and await dp.is_visible():
+                    await page.keyboard.press("Escape")
+                    await self._human_delay(page)
+            except Exception:
+                pass
+
+            checkout_ok, _ = await self._select_date_via_picker(
+                page, "wxa-input-container-DepartureDate", departure, "Check-out"
+            )
+            if not checkout_ok:
+                return []
 
             # 8. Wait for reCAPTCHA to signal readiness before clicking.
             #    The blockUI overlay is shown while reCAPTCHA initializes;
@@ -304,6 +440,8 @@ class YosemiteChecker:
                 page = self._page
                 continue
 
+            await page.hover("#box-widget > form .wxa-input-container-form-button-panel input.wxa-form-button")
+            await self._human_delay(page)
             await page.click("#box-widget > form .wxa-input-container-form-button-panel input.wxa-form-button")
             await self._wait_for_loading(page)
 
@@ -329,12 +467,24 @@ class YosemiteChecker:
                     pass
 
             if action_not_allowed:
-                if attempt == max_attempts:
-                    raise RuntimeError("'Action not allowed' validation error persisted after all retries")
-                print("  'Action not allowed' from server, resetting browser context ...", file=sys.stderr)
-                await self._new_context()
-                page = self._page
-                continue
+                property_name = PROPERTIES[property_code]["name"]
+                print(
+                    f"  Unable to gather room details — 'Action Not Allowed' browser response",
+                    file=sys.stderr,
+                )
+                if attempt < max_attempts:
+                    print("  retrying ...", file=sys.stderr)
+                    await self._new_context()
+                    page = self._page
+                    continue
+                return [{
+                    "property": property_name,
+                    "room_type": "Room details unavailable (Action Not Allowed)",
+                    "price": "N/A",
+                    "dates": f"{fmt_date(arrival)} - {fmt_date(departure)}",
+                    "checkin": arrival.date().isoformat(),
+                    "checkout": departure.date().isoformat(),
+                }]
 
             break  # successfully reached results page
 
@@ -574,16 +724,30 @@ examples:
     props_parser.add_argument("-o", "--output", choices=["table", "json"], default="table",
                               help="Output format (default: table)")
 
-    parser.add_argument("--start-date", metavar="YYYY-MM-DD", help="Check-in date")
-    parser.add_argument("--end-date",   metavar="YYYY-MM-DD", help="Check-out date")
+    parser.add_argument("--start-date", metavar="YYYY-MM-DD",
+                        default=os.environ.get("START_DATE"),
+                        help="Check-in date (env: START_DATE)")
+    parser.add_argument("--end-date", metavar="YYYY-MM-DD",
+                        default=os.environ.get("END_DATE"),
+                        help="Check-out date (env: END_DATE)")
     parser.add_argument("--property", metavar="CODE_OR_ALIAS",
+                        default=os.environ.get("PROPERTY"),
                         help="Comma-separated property codes/aliases (default: all). "
-                             "E.g. --property ahwahnee,valley-lodge or --property M,Y")
-    parser.add_argument("--adults",   type=int, default=2, metavar="N", help="Number of adults (default: 2)")
-    parser.add_argument("--children", type=int, default=0, metavar="N", help="Number of children age 12 and under (default: 0)")
-    parser.add_argument("--rooms",    type=int, default=1, metavar="N", help="Number of rooms (default: 1)")
+                             "E.g. --property ahwahnee,valley-lodge or --property M,Y (env: PROPERTY)")
+    parser.add_argument("--adults", type=int,
+                        default=int(os.environ["ADULTS"]) if "ADULTS" in os.environ else 2,
+                        metavar="N", help="Number of adults (default: 2, env: ADULTS)")
+    parser.add_argument("--children", type=int,
+                        default=int(os.environ["CHILDREN"]) if "CHILDREN" in os.environ else 0,
+                        metavar="N", help="Number of children age 12 and under (default: 0, env: CHILDREN)")
+    parser.add_argument("--rooms", type=int,
+                        default=int(os.environ["ROOMS"]) if "ROOMS" in os.environ else 1,
+                        metavar="N", help="Number of rooms (default: 1, env: ROOMS)")
     parser.add_argument("--scan", action="store_true",
-                        help="Check each single night individually across the date range")
+                        default=os.environ.get("SCAN", "").lower() in ("1", "true"),
+                        help="Check each single night individually across the date range (env: SCAN=1)")
+    parser.add_argument("--retries", type=int, default=3, metavar="N",
+                        help="Number of attempts per search before giving up (default: 3)")
     parser.add_argument("-o", "--output", choices=["table", "json"], default="table",
                         help="Output format (default: table)")
     parser.add_argument("--config", metavar="FILE",
@@ -616,6 +780,7 @@ async def _run_searches(
     adults: int,
     children: int,
     rooms: int,
+    retries: int,
     save_html: str | None,
 ) -> list[dict]:
     all_results: list[dict] = []
@@ -638,6 +803,7 @@ async def _run_searches(
                     adults=adults,
                     children=children,
                     rooms=rooms,
+                    retries=retries,
                 )
             except Exception as exc:
                 label = f"{code}_{arrival.strftime('%Y-%m-%d')}"
@@ -686,6 +852,7 @@ async def run(args: argparse.Namespace) -> None:
                     adults=search_def.get("adults", 2),
                     children=search_def.get("children", 0),
                     rooms=search_def.get("rooms", 1),
+                    retries=args.retries,
                     save_html=getattr(args, "save_html", None),
                 )
                 all_results.extend(results)
@@ -724,6 +891,7 @@ async def run(args: argparse.Namespace) -> None:
             adults=args.adults,
             children=args.children,
             rooms=args.rooms,
+            retries=args.retries,
             save_html=getattr(args, "save_html", None),
         )
 

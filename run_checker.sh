@@ -23,8 +23,8 @@ main() {
     log "Starting Yosemite availability check"
 
     local user_key api_token
-    user_key=$(python3 -c "import json; print(json.load(open('$CONFIG'))['pushover']['user_key'])")
-    api_token=$(python3 -c "import json; print(json.load(open('$CONFIG'))['pushover']['api_token'])")
+    user_key="${PUSHOVER_USER_KEY:-$(python3 -c "import json; print(json.load(open('$CONFIG'))['pushover']['user_key'])")}"
+    api_token="${PUSHOVER_API_TOKEN:-$(python3 -c "import json; print(json.load(open('$CONFIG'))['pushover']['api_token'])")}"
 
     if [[ -z "$user_key" || -z "$api_token" ]]; then
         log "ERROR: Pushover credentials not set in config.json"
@@ -36,7 +36,11 @@ main() {
     # Capture stdout (JSON) only; stderr (progress logs) flows through to the log file
     local headless_flag="--no-headless"
     [[ "${HEADLESS:-0}" == "1" ]] && headless_flag=""
-    output=$(uv run "$CHECKER" --config "$CONFIG" -o json $headless_flag) || exit_code=$?
+    # When START_DATE and END_DATE are set via env, run without --config so the
+    # Python script picks them up directly. Otherwise fall back to config.json.
+    local config_flag="--config $CONFIG"
+    [[ -n "${START_DATE:-}" && -n "${END_DATE:-}" ]] && config_flag=""
+    output=$(uv run "$CHECKER" $config_flag -o json $headless_flag) || exit_code=$?
 
     if [[ $exit_code -eq 0 ]]; then
         log "Availability found!"

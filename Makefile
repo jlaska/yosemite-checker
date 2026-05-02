@@ -35,7 +35,11 @@ uninstall:
 	@echo "Uninstalled."
 
 run: _check-config
-	HEADLESS=$(HEADLESS) bash run_checker.sh
+	HEADLESS=$(HEADLESS) \
+	START_DATE=$(START_DATE) END_DATE=$(END_DATE) PROPERTY=$(PROPERTY) \
+	ADULTS=$(ADULTS) CHILDREN=$(CHILDREN) ROOMS=$(ROOMS) SCAN=$(SCAN) \
+	PUSHOVER_USER_KEY=$(PUSHOVER_USER_KEY) PUSHOVER_API_TOKEN=$(PUSHOVER_API_TOKEN) \
+	bash run_checker.sh
 
 test-pushover: _check-config
 	@user_key=$$(python3 -c "import json; print(json.load(open('$(CONFIG)'))['pushover']['user_key'])"); \
@@ -72,10 +76,12 @@ release:
 	@echo "Done. Watch CI at https://github.com/jlaska/yosemite-checker/actions"
 
 _check-config:
-	@test -f "$(CONFIG)" || (echo "ERROR: $(CONFIG) not found. Copy config.json.example to config.json and fill in your credentials." && exit 1)
-	@python3 -c "\
+	@if [ -z "$(PUSHOVER_USER_KEY)" ] || [ -z "$(PUSHOVER_API_TOKEN)" ]; then \
+		test -f "$(CONFIG)" || (echo "ERROR: $(CONFIG) not found. Copy config.json.example to config.json and fill in your credentials." && exit 1); \
+		python3 -c "\
 import json, sys; \
 cfg = json.load(open('$(CONFIG)')); \
 po = cfg.get('pushover', {}); \
-(print('ERROR: Fill in pushover credentials in $(CONFIG)') or sys.exit(1)) \
-if not po.get('user_key') or not po.get('api_token') else None"
+(print('ERROR: Fill in pushover credentials in $(CONFIG) or set PUSHOVER_USER_KEY/PUSHOVER_API_TOKEN env vars') or sys.exit(1)) \
+if not po.get('user_key') or not po.get('api_token') else None"; \
+	fi

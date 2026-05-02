@@ -265,6 +265,28 @@ class YosemiteChecker:
     async def _human_delay(self, page: Page) -> None:
         await page.wait_for_timeout(random.randint(250, 1000))
 
+    async def _random_mouse_movement(self, page: Page) -> None:
+        """Simulate natural mouse movement across the viewport."""
+        for _ in range(random.randint(2, 4)):
+            x = random.randint(100, 1200)
+            y = random.randint(100, 800)
+            await page.mouse.move(x, y)
+            await page.wait_for_timeout(random.randint(50, 200))
+
+    async def _wait_for_recaptcha_token(self, page: Page, timeout: int = 15_000) -> bool:
+        """Poll until the reCAPTCHA token input is non-empty. Logs result to stderr."""
+        deadline = asyncio.get_event_loop().time() + timeout / 1000
+        while asyncio.get_event_loop().time() < deadline:
+            val = await page.evaluate(
+                "() => { const t = document.querySelector('#box-widget_RecaptchaToken'); return t ? t.value : ''; }"
+            )
+            if val:
+                print(f"  reCAPTCHA token: ready ({len(val)} chars)", file=sys.stderr)
+                return True
+            await page.wait_for_timeout(500)
+        print("  reCAPTCHA token: not populated after timeout", file=sys.stderr)
+        return False
+
     async def _read_datepicker_cells(self, page: Page) -> dict[int, str]:
         """Parse all day cells from the currently open datepicker into a day->availability map."""
         cells = await page.evaluate("""() => {
@@ -439,6 +461,9 @@ class YosemiteChecker:
                 await self._new_context()
                 page = self._page
                 continue
+
+            await self._random_mouse_movement(page)
+            await self._wait_for_recaptcha_token(page)  # logs token state; non-blocking
 
             await page.hover("#box-widget > form .wxa-input-container-form-button-panel input.wxa-form-button")
             await self._human_delay(page)
@@ -746,8 +771,8 @@ examples:
     parser.add_argument("--scan", action="store_true",
                         default=os.environ.get("SCAN", "").lower() in ("1", "true"),
                         help="Check each single night individually across the date range (env: SCAN=1)")
-    parser.add_argument("--retries", type=int, default=3, metavar="N",
-                        help="Number of attempts per search before giving up (default: 3)")
+    parser.add_argument("--retries", type=int, default=0, metavar="N",
+                        help="Number of additional attempts per search before giving up (default: 0)")
     parser.add_argument("-o", "--output", choices=["table", "json"], default="table",
                         help="Output format (default: table)")
     parser.add_argument("--config", metavar="FILE",
@@ -852,7 +877,7 @@ async def run(args: argparse.Namespace) -> None:
                     adults=search_def.get("adults", 2),
                     children=search_def.get("children", 0),
                     rooms=search_def.get("rooms", 1),
-                    retries=args.retries,
+                    retries=cfg.get("retries", args.retries),
                     save_html=getattr(args, "save_html", None),
                 )
                 all_results.extend(results)

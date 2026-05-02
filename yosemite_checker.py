@@ -579,33 +579,20 @@ class YosemiteChecker:
 
         results: list[dict] = []
 
-        # The site renders room cards. Common patterns from the AHLSMS system:
-        # Each unit is a panel/card with a title and price.
-        selectors = [
-            ".wxa-search-result-panel",
-            ".wxa-result",
-            ".panel.panel-default .panel-body",
-            "[class*='result'][class*='panel']",
-            ".accommodation-item",
-        ]
-
-        elements = []
-        for sel in selectors:
-            elements = await page.query_selector_all(sel)
-            if elements:
-                break
-
-        for el in elements:
+        rows = await page.query_selector_all("#tblDataTableResults tr")
+        for row in rows:
             try:
-                name_el = await el.query_selector("h2, h3, h4, .panel-title, [class*='name'], [class*='title']")
-                name = (await name_el.inner_text()).strip() if name_el else "Unknown Room"
+                price_el = await row.query_selector("h3.rate-result-item-price")
+                if not price_el:
+                    continue
+                price = (await price_el.inner_text()).strip()
 
-                price_el = await el.query_selector("[class*='price'], [class*='rate'], .price, .rate")
-                price = (await price_el.inner_text()).strip() if price_el else "N/A"
+                link_el = await row.query_selector("a.bigLink[data-x-title]")
+                room_type = (await link_el.get_attribute("data-x-title")) if link_el else "Unknown Room"
 
                 results.append({
                     "property": property_name,
-                    "room_type": name,
+                    "room_type": room_type or "Unknown Room",
                     "price": price,
                     "dates": f"{fmt_date(arrival)} - {fmt_date(departure)}",
                     "checkin": arrival.date().isoformat(),

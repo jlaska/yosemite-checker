@@ -43,11 +43,14 @@ main() {
     output=$(uv run "$CHECKER" $config_flag -o json $headless_flag) || exit_code=$?
 
     if [[ $exit_code -eq 0 ]]; then
-        log "Availability found!"
+        local total
+        total=$(echo "$output" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total_rooms',0))" 2>/dev/null || echo "0")
+        if [[ "$total" -gt 0 ]]; then
+            log "Availability found!"
 
-        # Build a human-readable summary from the JSON output
-        local summary
-        summary=$(echo "$output" | python3 -c "
+            # Build a human-readable summary from the JSON output
+            local summary
+            summary=$(echo "$output" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 lines = []
@@ -57,13 +60,14 @@ total = data.get('total_rooms', 0)
 lines.append(f\"\nTotal: {total} room(s) available\")
 print('\n'.join(lines))
 ")
-        log "$summary"
-        send_pushover "$user_key" "$api_token" \
-            "🏕 Yosemite Availability!" \
-            "$summary" 1
-        log "Pushover notification sent"
-    elif [[ $exit_code -eq 1 ]]; then
-        log "No availability found"
+            log "$summary"
+            send_pushover "$user_key" "$api_token" \
+                "🏕 Yosemite Availability!" \
+                "$summary" 1
+            log "Pushover notification sent"
+        else
+            log "No availability found"
+        fi
     else
         log "ERROR: checker exited with code $exit_code"
         log "$output"

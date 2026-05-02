@@ -12,6 +12,7 @@ import calendar
 import json
 import os
 import random
+import re
 import sys
 import urllib.request
 import urllib.parse
@@ -204,10 +205,24 @@ class YosemiteChecker:
         self._page = await self._context.new_page()
         self._page.set_default_timeout(90_000)
         self._console_log = []
+        self._recaptcha_token: str | None = None
         self._page.on("console", lambda msg: self._console_log.append(f"[{msg.type}] {msg.text}"))
         self._page.on("requestfailed", lambda req: self._console_log.append(
             f"[requestfailed] {req.failure} — {req.url}"
         ))
+
+        async def _recaptcha_response_handler(response) -> None:
+            if re.search(r"/recaptcha/(api2|enterprise)/reload", response.url) is None:
+                return
+            try:
+                text = await response.text()
+                match = re.search(r'"rresp","(.*?)"', text)
+                if match:
+                    self._recaptcha_token = match.group(1)
+            except Exception:
+                pass
+
+        self._page.on("response", _recaptcha_response_handler)
 
     async def dump_diagnostics(self, label: str) -> str:
         """Save current DOM and console log to a timestamped file pair, return base path.
@@ -274,14 +289,25 @@ class YosemiteChecker:
             await page.wait_for_timeout(random.randint(50, 200))
 
     async def _wait_for_recaptcha_token(self, page: Page, timeout: int = 15_000) -> bool:
-        """Poll until the reCAPTCHA token input is non-empty. Logs result to stderr."""
+        """Poll until the reCAPTCHA token is available via network interception or DOM.
+
+        Checks the network-intercepted token first, then falls back to the DOM element.
+        If the network token is available but the DOM is empty, injects it.
+        Logs the result to stderr.
+        """
         deadline = asyncio.get_event_loop().time() + timeout / 1000
         while asyncio.get_event_loop().time() < deadline:
+            if self._recaptcha_token:
+                print(f"  reCAPTCHA token: ready via network ({len(self._recaptcha_token)} chars)", file=sys.stderr)
+                await page.evaluate(
+                    f"document.querySelector('#box-widget_RecaptchaToken').value = {json.dumps(self._recaptcha_token)}"
+                )
+                return True
             val = await page.evaluate(
                 "() => { const t = document.querySelector('#box-widget_RecaptchaToken'); return t ? t.value : ''; }"
             )
             if val:
-                print(f"  reCAPTCHA token: ready ({len(val)} chars)", file=sys.stderr)
+                print(f"  reCAPTCHA token: ready via DOM ({len(val)} chars)", file=sys.stderr)
                 return True
             await page.wait_for_timeout(500)
         print("  reCAPTCHA token: not populated after timeout", file=sys.stderr)
@@ -407,6 +433,8 @@ class YosemiteChecker:
             if attempt > 1:
                 print(f"  waiting {retry_delay}s before retry (attempt {attempt}/{max_attempts}) ...", file=sys.stderr)
                 await page.wait_for_timeout(retry_delay * 1000)
+
+            self._recaptcha_token = None
 
             # 1. Navigate to the Plan-Your-Trip landing page
             await page.goto(SEARCH_URL, wait_until="load", timeout=90_000)
@@ -624,9 +652,12 @@ def _map_ga_item(item: dict, property_name: str, arrival: datetime, departure: d
 
 def print_table(results: list[dict], search_meta: dict) -> None:
     if not results:
-        start = search_meta["start_date"]
-        end   = search_meta["end_date"]
-        print(f"No availability found for {start} - {end}")
+        start = search_meta.get("start_date")
+        end   = search_meta.get("end_date")
+        if start and end:
+            print(f"No availability found for {start} - {end}")
+        else:
+            print("No availability found")
         return
 
     cols = {
@@ -663,9 +694,10 @@ def print_json(results: list[dict], search_meta: dict) -> None:
     print(json.dumps(output, indent=2))
 
 
-def _send_pushover(results: list[dict], search_meta: dict) -> None:
-    user_key  = os.environ.get("PUSHOVER_USER_KEY", "")
-    api_token = os.environ.get("PUSHOVER_API_TOKEN", "")
+def _send_pushover(results: list[dict], search_meta: dict,
+                   user_key: str = "", api_token: str = "") -> None:
+    user_key  = user_key  or os.environ.get("PUSHOVER_USER_KEY", "")
+    api_token = api_token or os.environ.get("PUSHOVER_API_TOKEN", "")
     if not user_key or not api_token:
         return
     lines = [
@@ -888,8 +920,11 @@ async def run(args: argparse.Namespace) -> None:
         else:
             print_table(all_results, search_meta)
         if all_results:
-            _send_pushover(all_results, search_meta)
-        sys.exit(0 if all_results else 1)
+            po = cfg.get("pushover", {})
+            _send_pushover(all_results, search_meta,
+                           user_key=po.get("user_key", ""),
+                           api_token=po.get("api_token", ""))
+        sys.exit(0)
 
     # Normal CLI mode
     if not args.start_date or not args.end_date:
@@ -938,7 +973,7 @@ async def run(args: argparse.Namespace) -> None:
     if all_results:
         _send_pushover(all_results, search_meta)
 
-    sys.exit(0 if all_results else 1)
+    sys.exit(0)
 
 
 def main() -> None:

@@ -375,13 +375,22 @@ class YosemiteChecker:
         await page.wait_for_selector("#ui-datepicker-div", state="visible", timeout=5_000)
         await self._wait_for_loading(page)
 
-        await page.select_option("#ui-datepicker-div select.ui-datepicker-year", str(year))
-        await self._human_delay(page)
-        await self._wait_for_loading(page)
+        cur_year = await page.evaluate(
+            "document.querySelector('#ui-datepicker-div select.ui-datepicker-year').value"
+        )
+        cur_month = await page.evaluate(
+            "document.querySelector('#ui-datepicker-div select.ui-datepicker-month').value"
+        )
 
-        await page.select_option("#ui-datepicker-div select.ui-datepicker-month", str(month))
-        await self._human_delay(page)
-        await self._wait_for_loading(page)
+        if str(year) != str(cur_year):
+            await page.select_option("#ui-datepicker-div select.ui-datepicker-year", str(year))
+            await self._human_delay(page)
+            await self._wait_for_loading(page)
+
+        if str(month) != str(cur_month):
+            await page.select_option("#ui-datepicker-div select.ui-datepicker-month", str(month))
+            await self._human_delay(page)
+            await self._wait_for_loading(page)
 
         avail = await self._scan_calendar_availability(page, label, year, month, highlight_day=day)
 

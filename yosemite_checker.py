@@ -84,7 +84,7 @@ def render_calendar(year: int, month_0: int, avail: dict[int, str], label: str,
     month_name = calendar.month_name[month]
     title = f"{month_name} {year}"
 
-    lines = [f"  {label} calendar:", ""]
+    lines = [label]
     lines.append(f"      {title:^20}")
     lines.append("  Su Mo Tu We Th Fr Sa")
 
@@ -251,7 +251,7 @@ class YosemiteChecker:
             with open(f"{base}.html", "w", encoding="utf-8") as f:
                 f.write(html)
         except Exception as e:
-            print(f"  (could not save HTML: {e})", file=sys.stderr)
+            print(f"(could not save HTML: {e})", file=sys.stderr)
 
         with open(f"{base}.log", "w", encoding="utf-8") as f:
             f.write(log_content)
@@ -298,7 +298,7 @@ class YosemiteChecker:
         deadline = asyncio.get_event_loop().time() + timeout / 1000
         while asyncio.get_event_loop().time() < deadline:
             if self._recaptcha_token:
-                print(f"  reCAPTCHA token: ready via network ({len(self._recaptcha_token)} chars)", file=sys.stderr)
+                print(f"reCAPTCHA token: ready via network ({len(self._recaptcha_token)} chars)", file=sys.stderr)
                 await page.evaluate(
                     f"document.querySelector('#box-widget_RecaptchaToken').value = {json.dumps(self._recaptcha_token)}"
                 )
@@ -307,10 +307,10 @@ class YosemiteChecker:
                 "() => { const t = document.querySelector('#box-widget_RecaptchaToken'); return t ? t.value : ''; }"
             )
             if val:
-                print(f"  reCAPTCHA token: ready via DOM ({len(val)} chars)", file=sys.stderr)
+                print(f"reCAPTCHA token: ready via DOM ({len(val)} chars)", file=sys.stderr)
                 return True
             await page.wait_for_timeout(500)
-        print("  reCAPTCHA token: not populated after timeout", file=sys.stderr)
+        print("reCAPTCHA token: not populated after timeout", file=sys.stderr)
         return False
 
     async def _read_datepicker_cells(self, page: Page) -> dict[int, str]:
@@ -383,7 +383,7 @@ class YosemiteChecker:
         avail = await self._scan_calendar_availability(page, label, year, month, highlight_day=day)
 
         if avail.get(day, "none") == "none":
-            print(f"  {label} {target_date.strftime('%Y-%m-%d')}: no availability — skipping", file=sys.stderr)
+            print(f"{label}: no availability — skipping", file=sys.stderr)
             await page.keyboard.press("Escape")
             return False, avail
 
@@ -431,7 +431,7 @@ class YosemiteChecker:
         retry_delay  = 15
         for attempt in range(1, max_attempts + 1):
             if attempt > 1:
-                print(f"  waiting {retry_delay}s before retry (attempt {attempt}/{max_attempts}) ...", file=sys.stderr)
+                print(f"waiting {retry_delay}s before retry (attempt {attempt}/{max_attempts}) ...", file=sys.stderr)
                 await page.wait_for_timeout(retry_delay * 1000)
 
             self._recaptcha_token = None
@@ -456,7 +456,7 @@ class YosemiteChecker:
 
             # 6. Set check-in via datepicker; scans calendar and returns False if unavailable
             checkin_ok, _ = await self._select_date_via_picker(
-                page, "wxa-input-container-ArrivalDate", arrival, "Check-in"
+                page, "wxa-input-container-ArrivalDate", arrival, f"Check-in: {arrival.strftime('%Y-%m-%d')}"
             )
             if not checkin_ok:
                 return []
@@ -471,7 +471,7 @@ class YosemiteChecker:
                 pass
 
             checkout_ok, _ = await self._select_date_via_picker(
-                page, "wxa-input-container-DepartureDate", departure, "Check-out"
+                page, "wxa-input-container-DepartureDate", departure, f"Check-out: {departure.strftime('%Y-%m-%d')}"
             )
             if not checkout_ok:
                 return []
@@ -485,7 +485,7 @@ class YosemiteChecker:
             except Exception:
                 if attempt == max_attempts:
                     raise RuntimeError("reCAPTCHA never became ready after all retries")
-                print("  reCAPTCHA not ready (blockUI stuck), resetting context ...", file=sys.stderr)
+                print("reCAPTCHA not ready (blockUI stuck), resetting context ...", file=sys.stderr)
                 await self._new_context()
                 page = self._page
                 continue
@@ -522,11 +522,11 @@ class YosemiteChecker:
             if action_not_allowed:
                 property_name = PROPERTIES[property_code]["name"]
                 print(
-                    f"  Unable to gather room details — 'Action Not Allowed' browser response",
+                    "Unable to gather room details — 'Action Not Allowed' browser response",
                     file=sys.stderr,
                 )
                 if attempt < max_attempts:
-                    print("  retrying ...", file=sys.stderr)
+                    print("retrying ...", file=sys.stderr)
                     await self._new_context()
                     page = self._page
                     continue
@@ -637,10 +637,22 @@ def _map_ga_item(item: dict, property_name: str, arrival: datetime, departure: d
 # Output formatting
 # ──────────────────────────────────────────────────────────────────────────────
 
-def print_table(results: list[dict], search_meta: dict) -> None:
+def print_search_banner(search_meta: dict) -> None:
+    prop_names = search_meta.get("property_names", [])
+    adults   = search_meta.get("adults", 2)
+    children = search_meta.get("children", 0)
+    rooms    = search_meta.get("rooms", 1)
+    guest_parts = [f"{adults} adult{'s' if adults != 1 else ''}"]
+    if children:
+        guest_parts.append(f"{children} child{'ren' if children != 1 else ''}")
+    parts = [", ".join(prop_names), ", ".join(guest_parts), f"{rooms} room{'s' if rooms != 1 else ''}"]
+    print(f"Search: {' | '.join(parts)}\n")
+
+
+def print_table(results: list[dict], search_meta: dict | None = None) -> None:
     if not results:
-        start = search_meta.get("start_date")
-        end   = search_meta.get("end_date")
+        start = (search_meta or {}).get("start_date")
+        end   = (search_meta or {}).get("end_date")
         if start and end:
             print(f"No availability found for {start} - {end}")
         else:
@@ -667,6 +679,8 @@ def print_table(results: list[dict], search_meta: dict) -> None:
         )
         print(row)
 
+
+def print_summary(results: list[dict]) -> None:
     n = len(results)
     props = len({r["property"] for r in results})
     print(f"\n{n} room{'s' if n != 1 else ''} available across {props} propert{'ies' if props != 1 else 'y'}")
@@ -831,14 +845,8 @@ async def _run_searches(
     html_counter = 0
 
     for arrival, departure in windows:
+        window_results: list[dict] = []
         for code in prop_codes:
-            prop_name = PROPERTIES[code]["name"]
-            if len(windows) > 1 or len(prop_codes) > 1:
-                print(
-                    f"Checking {prop_name}: {arrival.strftime('%Y-%m-%d')} → {departure.strftime('%Y-%m-%d')} ...",
-                    file=sys.stderr,
-                )
-
             try:
                 results = await checker.search(
                     arrival=arrival,
@@ -852,8 +860,8 @@ async def _run_searches(
             except Exception as exc:
                 label = f"{code}_{arrival.strftime('%Y-%m-%d')}"
                 base = await checker.dump_diagnostics(label)
-                print(f"  error: {exc}", file=sys.stderr)
-                print(f"  diagnostics saved to {base}.html and {base}.log", file=sys.stderr)
+                print(f"error: {exc}", file=sys.stderr)
+                print(f"diagnostics saved to {base}.html and {base}.log", file=sys.stderr)
                 raise
 
             if save_html:
@@ -866,7 +874,9 @@ async def _run_searches(
                 with open(fname, "w", encoding="utf-8") as f:
                     f.write(page_html)
 
-            all_results.extend(results)
+            window_results.extend(results)
+
+        all_results.extend(window_results)
 
     return all_results
 
@@ -891,24 +901,35 @@ async def run(args: argparse.Namespace) -> None:
                 end   = parse_date(search_def["end_date"])
                 prop_codes = resolve_properties(search_def["property"]) if search_def.get("property") else list(PROPERTIES.keys())
                 windows = _build_windows(start, end, search_def.get("scan", False))
+                adults   = search_def.get("adults", 2)
+                children = search_def.get("children", 0)
+                rooms    = search_def.get("rooms", 1)
+                search_meta = {
+                    "property_names": [PROPERTIES[c]["name"] for c in prop_codes],
+                    "adults": adults,
+                    "children": children,
+                    "rooms": rooms,
+                }
+                if args.output == "table":
+                    print_search_banner(search_meta)
                 results = await _run_searches(
                     checker, windows, prop_codes,
-                    adults=search_def.get("adults", 2),
-                    children=search_def.get("children", 0),
-                    rooms=search_def.get("rooms", 1),
+                    adults=adults,
+                    children=children,
+                    rooms=rooms,
                     retries=cfg.get("retries", args.retries),
                     save_html=getattr(args, "save_html", None),
                 )
                 all_results.extend(results)
 
-        search_meta = {"config": args.config}
         if args.output == "json":
-            print_json(all_results, search_meta)
+            print_json(all_results, {"config": args.config})
         else:
-            print_table(all_results, search_meta)
+            print_table(all_results)
+            print_summary(all_results)
         if all_results:
             po = cfg.get("pushover", {})
-            _send_pushover(all_results, search_meta,
+            _send_pushover(all_results, {"config": args.config},
                            user_key=po.get("user_key", ""),
                            api_token=po.get("api_token", ""))
         sys.exit(0)
@@ -932,6 +953,20 @@ async def run(args: argparse.Namespace) -> None:
     prop_codes = resolve_properties(args.property) if args.property else list(PROPERTIES.keys())
     windows = _build_windows(start, end, args.scan)
 
+    search_meta = {
+        "start_date":     args.start_date,
+        "end_date":       args.end_date,
+        "adults":         args.adults,
+        "children":       args.children,
+        "rooms":          args.rooms,
+        "properties":     prop_codes,
+        "property_names": [PROPERTIES[c]["name"] for c in prop_codes],
+        "scan":           args.scan,
+    }
+
+    if args.output == "table":
+        print_search_banner(search_meta)
+
     async with YosemiteChecker(headless=headless, browser_ws=browser_ws) as checker:
         all_results = await _run_searches(
             checker, windows, prop_codes,
@@ -942,20 +977,11 @@ async def run(args: argparse.Namespace) -> None:
             save_html=getattr(args, "save_html", None),
         )
 
-    search_meta = {
-        "start_date": args.start_date,
-        "end_date":   args.end_date,
-        "adults":     args.adults,
-        "children":   args.children,
-        "rooms":      args.rooms,
-        "properties": prop_codes,
-        "scan":       args.scan,
-    }
-
     if args.output == "json":
         print_json(all_results, search_meta)
     else:
         print_table(all_results, search_meta)
+        print_summary(all_results)
 
     if all_results:
         _send_pushover(all_results, search_meta)

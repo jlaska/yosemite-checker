@@ -322,6 +322,7 @@ class YosemiteChecker:
             return Array.from(tds).map(td => ({
                 classes: td.className,
                 text: (td.querySelector('a') || td.querySelector('span') || td).textContent.trim(),
+                selectable: td.dataset.handler === 'selectDay',
             }));
         }""")
 
@@ -339,6 +340,8 @@ class YosemiteChecker:
                 avail[day] = "significant"
             elif "ui-datepickerAvail-limited" in cls:
                 avail[day] = "limited"
+            elif cell.get("selectable"):
+                avail[day] = "significant"
             else:
                 avail[day] = "none"
         return avail
